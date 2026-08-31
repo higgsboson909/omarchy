@@ -23,6 +23,16 @@ Panel {
 
   readonly property var adapter: Bluetooth.defaultAdapter
 
+  // BlueZ removes defaultAdapter while rfkill is blocking Bluetooth. Keep a
+  // separate hardware signal so that state is not mistaken for absent hardware.
+  property bool hardwarePresent: false
+  property bool powerChangePending: false
+  property bool requestedPowerState: false
+
+  readonly property bool displayPowerState: powerChangePending
+    ? requestedPowerState
+    : !!adapter && adapter.enabled
+
   // True while this instance owes BlueZ a StopDiscovery: set when it starts
   // discovery (or opens onto a session already running) and cleared once
   // discovery is confirmed down after close. Ownership, not state — BlueZ's
@@ -56,8 +66,7 @@ Panel {
   readonly property var discoveredDevices: deviceGroups.discovered || []
 
   readonly property string icon: {
-    if (!adapter) return ""
-    if (!adapter.enabled) return "󰂲"
+    if (!root.displayPowerState) return "󰂲"
     if (connectedDevices.length > 0) return "󰂱"
     return "󰂯"
   }
@@ -75,7 +84,7 @@ Panel {
   ]
   readonly property bool rotatingPhrases: adapter && adapter.enabled
   readonly property string heroStatusText: {
-    if (!adapter) return "No adapter"
+    if (!adapter) return hardwarePresent ? "Turn Bluetooth on" : "No adapter"
     if (!adapter.enabled) return "Turned Off"
     return activePhrases[phraseIndex % activePhrases.length]
   }
@@ -101,7 +110,7 @@ Panel {
   // sits above the device sections so the adapter can be toggled by keyboard
   // even when it is off and no device rows exist.
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
-  readonly property string toggleHint: root.adapter && root.adapter.enabled ? "Turn Bluetooth off" : "Turn Bluetooth on"
+  readonly property string toggleHint: root.displayPowerState ? "Turn Bluetooth off" : "Turn Bluetooth on"
 
   readonly property color hoverFill: bar
     ? Style.hoverFillFor(bar.foreground, Color.accent)
@@ -497,9 +506,50 @@ Panel {
     if (selectedIndex < 0) selectedIndex = 0
   }
 
-  visible: adapter !== null
+  // Keep the bar affordance available while rfkill blocks Bluetooth.
+  visible: true
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
+
+  // rfkill is authoritative while Bluetooth is blocked: BlueZ exposes no
+  // defaultAdapter then, but rfkill still lists the physical controller.
+  Process {
+    id: hardwareProbe
+    command: ["rfkill", "list", "bluetooth"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.hardwarePresent = text.toLowerCase().indexOf("bluetooth") !== -1
+      }
+    }
+    Component.onCompleted: running = true
+  }
+
+  Timer {
+    interval: 1500
+    repeat: true
+    running: true
+    onTriggered: if (!hardwareProbe.running) hardwareProbe.running = true
+  }
+
+  Timer {
+    id: powerChangeTimer
+    interval: 100
+    repeat: true
+    property int attempts: 0
+    onTriggered: {
+      attempts += 1
+      var reached = root.requestedPowerState
+        ? !!root.adapter && root.adapter.enabled
+        : !root.adapter || !root.adapter.enabled
+      if (reached || attempts >= 30) {
+        root.powerChangePending = false
+        stop()
+        attempts = 0
+      }
+    }
+    onRunningChanged: if (running) attempts = 0
+  }
 
   // BlueZ rejects StartDiscovery while the adapter is still powering up, and
   // discovery can also time out on its own. While the panel is open, keep
@@ -629,12 +679,14 @@ Panel {
   // rfkill soft block instead, which systemd-rfkill restores across reboots.
   // Powered still follows the block, so the switch and icon read it as before.
   //
-  // Asking for a direction rather than a toggle: the helper runs detached and the
-  // switch only moves once BlueZ catches up, so a second click inside that window
-  // would re-read the old state and undo the first.
+  // Update the controls before launching the asynchronous power helper, then
+  // reconcile with BlueZ once it reports the requested state.
   function toggleBluetooth() {
-    if (!adapter) return
-    Quickshell.execDetached(["omarchy-bluetooth-power", adapter.enabled ? "off" : "on"])
+    if (powerChangePending) return
+    requestedPowerState = !displayPowerState
+    powerChangePending = true
+    powerChangeTimer.restart()
+    Quickshell.execDetached(["omarchy-bluetooth-power", requestedPowerState ? "on" : "off"])
   }
 
   IpcHandler {
@@ -705,15 +757,15 @@ Panel {
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.display
-            opacity: root.adapter && root.adapter.enabled ? 1.0 : 0.5
+            opacity: root.displayPowerState ? 1.0 : 0.5
           }
 
           // Compact on/off switch on the trailing edge of the hero, and the
           // header's only cursor target.
           ToggleSwitch {
             id: powerSwitch
-            visible: !!root.adapter
-            checked: !!root.adapter && root.adapter.enabled
+            visible: root.hardwarePresent
+            checked: root.displayPowerState
             hasCursor: root.headerHasCursor
             foreground: root.bar.foreground
             anchors.right: parent.right
@@ -867,7 +919,8 @@ Panel {
         Text {
           textFormat: Text.PlainText
           visible: root.connectedDevices.length === 0 && root.scrollRows.length === 0
-          text: !root.adapter ? "No Bluetooth adapter"
+          text: !root.hardwarePresent ? "No Bluetooth adapter"
+              : !root.adapter ? "Click the switch above to turn Bluetooth on"
               : !root.adapter.enabled ? "Turn Bluetooth on to scan"
               : "Scanning for devices…"
           color: Qt.darker(root.bar.foreground, 1.5)
